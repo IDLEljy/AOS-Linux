@@ -1,0 +1,9 @@
+metric,Ubuntu_5.15,Mainline_Linux_6.12,AOS_Linux_6.12,notes
+UnixBench_single_mean,711.03,796.27,753.93,history_values_three_round_mean_for_6_12
+UnixBench_dual_mean,1020.47,1132.13,1079.17,history_values_three_round_mean_for_6_12
+TerminalBench_oracle_pass,13,13,20,denominator_25
+TerminalBench_oracle_total,25,25,25,
+TerminalBench_agent_pass,14,14,14,denominator_22
+TerminalBench_agent_total,22,22,22,
+TerminalBench_flash_pass,,8,7,denominator_13
+TerminalBench_v4pro_pass,,6,7,denominator_9

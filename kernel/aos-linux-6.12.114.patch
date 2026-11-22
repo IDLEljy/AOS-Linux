@@ -1,0 +1,595 @@
+diff -ruN linux-pristine/include/uapi/linux/aos.h linux-src/include/uapi/linux/aos.h
+--- linux-pristine/include/uapi/linux/aos.h	1970-01-01 08:00:00.000000000 +0800
++++ linux-src/include/uapi/linux/aos.h	2026-10-25 11:39:56.702907574 +0800
+@@ -0,0 +1,120 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * AOS (Agent Operating System) - user space API.
++ *
++ * AOS is a minimal task-containment facility for agent workloads: a
++ * supervisor creates an AOS task, starts a transient scope, then binds
++ * the task to that scope using an open cgroup v2 directory descriptor.
++ * Every task in the bound cgroup subtree is subject to the policy.
++ */
++#ifndef _UAPI_LINUX_AOS_H
++#define _UAPI_LINUX_AOS_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++#define AOS_ABI_VERSION	1
++#define AOS_TASK_ID_LEN	64
++#define AOS_PATH_MAX	1024
++
++/*
++ * Restriction bits, set at task creation time and enforced by the LSM
++ * hooks.  Everything not requested stays permissive.
++ */
++#define AOS_RESTRICT_EXEC	(1ULL << 0)	/* exec only via pinned path */
++#define AOS_RESTRICT_READ	(1ULL << 1)	/* file reads inside wokspace only */
++#define AOS_RESTRICT_WRITE	(1ULL << 2)	/* file writes inside wokspace only */
++#define AOS_RESTRICT_ALL	(AOS_RESTRICT_EXEC | \
++				 AOS_RESTRICT_READ | \
++				 AOS_RESTRICT_WRITE)
++
++/*
++ * Audit verbosity.  Level 0 disables AOS audit records; level 1 records
++ * denials; level 2 records every checked operation.
++ */
++#define AOS_AUDIT_NONE		0
++#define AOS_AUDIT_DENY		1
++#define AOS_AUDIT_ALL		2
++
++/**
++ * struct aos_task_create - argument for AOS_IOC_TASK_CREATE
++ * @label:		nul-terminated human readable name (<= AOS_TASK_ID_LEN)
++ * @workspace_path:	nul-terminated workspace directory path
++ * @exec_path:		nul-terminated pinned executable path (may be empty)
++ * @restrict_flags:	bitmask of AOS_RESTRICT_*
++ * @audit_level:	one of AOS_AUDIT_*
++ * @task_id:		output: the kernel-assigned task id
++ */
++struct aos_task_create {
++	char	label[AOS_TASK_ID_LEN];
++	char	workspace_path[AOS_PATH_MAX];
++	char	exec_path[AOS_PATH_MAX];
++	__u64	restrict_flags;
++	__u64	audit_level;
++	__u64	task_id;
++};
++
++/**
++ * struct aos_task_bind - argument for AOS_IOC_TASK_BIND
++ * @task_id:	id returned by AOS_IOC_TASK_CREATE
++ * @cgroup_fd:	fd of an open non-root cgroup v2 directory; scope must be stopped before finish
++ * @flags:	must be 0
++ */
++struct aos_task_bind {
++	__u64	task_id;
++	__s32	cgroup_fd;
++	__u32	flags;
++};
++
++/**
++ * struct aos_task_query - argument for AOS_IOC_TASK_QUERY
++ * @task_id:	id to query
++ * @flags:	must be 0
++ * @n_threads:	output: live thread-group leaders in the bound cgroup subtree
++ * @n_finished:	output: number of threads that already finished
++ * @restrict_flags: output: the task's restriction mask
++ * @audit_level:	output: the task's audit level
++ */
++struct aos_task_query {
++	__u64	task_id;
++	__u64	flags;
++	__u64	n_threads;
++	__u64	n_finished;
++	__u64	restrict_flags;
++	__u64	audit_level;
++};
++
++/**
++ * struct aos_task_finish - argument for AOS_IOC_TASK_FINISH
++ * @task_id:	id of the task being retired
++ * @flags:	must be 0
++ */
++struct aos_task_finish {
++	__u64	task_id;
++	__u64	flags;
++};
++
++/**
++ * struct aos_task_policy - argument for AOS_IOC_TASK_POLICY
++ * @task_id:	id of the task to modify
++ * @flags:	must be 0
++ * @restrict_flags: new restriction mask (AOS_RESTRICT_*)
++ * @audit_level:	new audit level (AOS_AUDIT_*)
++ */
++struct aos_task_policy {
++	__u64	task_id;
++	__u64	flags;
++	__u64	restrict_flags;
++	__u64	audit_level;
++};
++
++#define AOS_IOC_MAGIC		0xA9
++#define AOS_IOC_GET_ABI_VERSION _IOR(AOS_IOC_MAGIC, 0x00, __u32)
++
++#define AOS_IOC_TASK_CREATE	_IOWR(AOS_IOC_MAGIC, 0x01, struct aos_task_create)
++#define AOS_IOC_TASK_BIND	_IOW(AOS_IOC_MAGIC, 0x02, struct aos_task_bind)
++#define AOS_IOC_TASK_POLICY	_IOW(AOS_IOC_MAGIC, 0x03, struct aos_task_policy)
++#define AOS_IOC_TASK_QUERY	_IOWR(AOS_IOC_MAGIC, 0x04, struct aos_task_query)
++#define AOS_IOC_TASK_FINISH	_IOW(AOS_IOC_MAGIC, 0x05, struct aos_task_finish)
++
++#endif /* _UAPI_LINUX_AOS_H */
+diff -ruN linux-pristine/include/uapi/linux/lsm.h linux-src/include/uapi/linux/lsm.h
+--- linux-pristine/include/uapi/linux/lsm.h	2026-10-21 16:31:09.000000000 +0800
++++ linux-src/include/uapi/linux/lsm.h	2026-10-25 10:35:50.001036585 +0800
+@@ -65,6 +65,7 @@
+ #define LSM_ID_IMA		111
+ #define LSM_ID_EVM		112
+ #define LSM_ID_IPE		113
++#define LSM_ID_AOS		114
+ 
+ /*
+  * LSM_ATTR_XXX definitions identify different LSM attributes
+diff -ruN linux-pristine/security/aos/aos_audit.c linux-src/security/aos/aos_audit.c
+--- linux-pristine/security/aos/aos_audit.c	1970-01-01 08:00:00.000000000 +0800
++++ linux-src/security/aos/aos_audit.c	2026-10-25 11:37:36.373276977 +0800
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * AOS audit: emit audit records for AOS task lifecycle and access
++ * decisions, honouring the task's audit_level.
++ */
++
++#include "aos_internal.h"
++
++static void aos_audit_print(struct aos_task *task, const char *op,
++			    const char *path, bool allowed, int eno_hint)
++{
++	struct audit_buffer *ab;
++
++	if (!task || !task->audit_level)
++		return;
++	if (!allowed && task->audit_level < AOS_AUDIT_DENY)
++		return;
++	if (allowed && task->audit_level < AOS_AUDIT_ALL)
++		return;
++
++	ab = audit_log_start(audit_context(), GFP_ATOMIC, AUDIT_ANOM_ABEND);
++	if (!ab)
++		return;
++
++	audit_log_format(ab, "aos op=%s task_id=%llu label=\"%s\" allowed=%d",
++			 op, task->id, task->label, allowed);
++	if (path && path[0])
++		audit_log_format(ab, " path=\"%s\"", path);
++	if (!allowed)
++		audit_log_format(ab, " eno=%d", eno_hint);
++	audit_log_end(ab);
++}
++
++void aos_audit_event(struct aos_task *task, const char *op, const char *path,
++		     bool allowed, int eno_hint)
++{
++	aos_audit_print(task, op, path, allowed, eno_hint);
++}
++
++int __init aos_audit_init(void)
++{
++	return 0;
++}
+diff -ruN linux-pristine/security/aos/aos_control.c linux-src/security/aos/aos_control.c
+--- linux-pristine/security/aos/aos_control.c	1970-01-01 08:00:00.000000000 +0800
++++ linux-src/security/aos/aos_control.c	2026-10-25 11:40:42.078051563 +0800
+@@ -0,0 +1,70 @@
++// SPDX-License-Identifier: GPL-2.0
++#include "aos_internal.h"
++#include <linux/user_namespace.h>
++
++static const struct file_operations aos_control_fops={
++ .owner=THIS_MODULE,.unlocked_ioctl=aos_control_ioctl,.compat_ioctl=compat_ptr_ioctl,
++ .llseek=no_llseek,
++};
++static struct miscdevice aos_control_device={
++ .minor=MISC_DYNAMIC_MINOR,.name="aosctl",.fops=&aos_control_fops,.mode=0600,
++};
++long aos_control_ioctl(struct file *file,unsigned int cmd,unsigned long arg)
++{
++ void __user *uarg=(void __user *)arg; struct aos_task *task; long ret;
++ if(!ns_capable(&init_user_ns,CAP_SYS_ADMIN)) return -EPERM;
++ if(cmd==AOS_IOC_GET_ABI_VERSION) { __u32 version=AOS_ABI_VERSION; return copy_to_user(uarg,&version,sizeof(version))?-EFAULT:0; }
++ switch(cmd) {
++ case AOS_IOC_TASK_CREATE: {
++  struct aos_task_create karg; u64 id;
++  if(copy_from_user(&karg,uarg,sizeof(karg))) return -EFAULT;
++  if(!memchr(karg.label,0,sizeof(karg.label))||!memchr(karg.workspace_path,0,sizeof(karg.workspace_path))||!memchr(karg.exec_path,0,sizeof(karg.exec_path))) return -EINVAL;
++  task=aos_task_create_task(karg.label,karg.workspace_path,karg.exec_path,karg.restrict_flags,karg.audit_level,&id);
++  if(IS_ERR(task)) return PTR_ERR(task);
++  aos_task_put(task); karg.task_id=id;
++  return copy_to_user(uarg,&karg,sizeof(karg))?-EFAULT:0;
++ }
++ case AOS_IOC_TASK_BIND: {
++  struct aos_task_bind karg;
++  if(copy_from_user(&karg,uarg,sizeof(karg))) return -EFAULT;
++  if(karg.flags) return -EINVAL;
++  task=aos_task_get(karg.task_id); if(!task) return -ENOENT;
++  ret=aos_task_bind(task,karg.cgroup_fd); aos_task_put(task); return ret;
++ }
++ case AOS_IOC_TASK_POLICY: {
++  struct aos_task_policy karg;
++  if(copy_from_user(&karg,uarg,sizeof(karg))) return -EFAULT;
++  if(karg.flags) return -EINVAL;
++  task=aos_task_get(karg.task_id); if(!task) return -ENOENT;
++  ret=aos_policy_check_restrict_flags(karg.restrict_flags);
++  if(!ret&&(karg.restrict_flags&AOS_RESTRICT_EXEC)&&!task->executable.dentry) ret=-EINVAL;
++  if(!ret) ret=aos_policy_check_audit_level(karg.audit_level);
++  if(!ret) { spin_lock(&task->lock); WRITE_ONCE(task->restrict_flags,karg.restrict_flags); WRITE_ONCE(task->audit_level,karg.audit_level); spin_unlock(&task->lock); aos_audit_event(task,"task-policy",NULL,true,0); }
++  aos_task_put(task); return ret;
++ }
++ case AOS_IOC_TASK_QUERY: {
++  struct aos_task_query karg;
++  if(copy_from_user(&karg,uarg,sizeof(karg))) return -EFAULT;
++  if(karg.flags) return -EINVAL;
++  task=aos_task_get(karg.task_id); if(!task) return -ENOENT;
++  karg.n_threads=aos_task_count_cgroup(task); karg.n_finished=atomic64_read(&task->n_finished);
++  karg.restrict_flags=READ_ONCE(task->restrict_flags); karg.audit_level=READ_ONCE(task->audit_level);
++  aos_task_put(task); return copy_to_user(uarg,&karg,sizeof(karg))?-EFAULT:0;
++ }
++ case AOS_IOC_TASK_FINISH: {
++  struct aos_task_finish karg;
++  if(copy_from_user(&karg,uarg,sizeof(karg))) return -EFAULT;
++  if(karg.flags) return -EINVAL;
++  return aos_task_finish(karg.task_id);
++ }
++ default: return -ENOTTY;
++ }
++}
++int __init aos_control_init(void)
++{
++ int ret;
++ ret=aos_task_init(); if(ret) return ret;
++ ret=aos_policy_init(); if(ret) return ret;
++ ret=aos_audit_init(); if(ret) return ret;
++ return misc_register(&aos_control_device);
++}
+diff -ruN linux-pristine/security/aos/aos_internal.h linux-src/security/aos/aos_internal.h
+--- linux-pristine/security/aos/aos_internal.h	1970-01-01 08:00:00.000000000 +0800
++++ linux-src/security/aos/aos_internal.h	2026-10-25 11:39:28.631581189 +0800
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _SECURITY_AOS_INTERNAL_H
++#define _SECURITY_AOS_INTERNAL_H
++#include <linux/audit.h>
++#include <linux/cgroup.h>
++#include <linux/fs.h>
++#include <linux/hashtable.h>
++#include <linux/init.h>
++#include <linux/kref.h>
++#include <linux/miscdevice.h>
++#include <linux/mutex.h>
++#include <linux/namei.h>
++#include <linux/path.h>
++#include <linux/sched.h>
++#include <linux/security.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <uapi/linux/aos.h>
++struct aos_task {
++ u64 id;
++ struct path workspace, executable;
++ char label[AOS_TASK_ID_LEN], workspace_path[AOS_PATH_MAX], exec_path[AOS_PATH_MAX];
++ u64 restrict_flags, audit_level;
++ atomic64_t n_finished;
++ bool finishing;
++ struct cgroup *cgrp;
++ spinlock_t lock;
++ struct hlist_node hash;
++ struct kref kref;
++};
++int __init aos_task_init(void);
++struct aos_task *aos_task_create_task(const char *, const char *, const char *, u64, u64, u64 *);
++struct aos_task *aos_task_get(u64);
++void aos_task_put(struct aos_task *);
++int aos_task_bind(struct aos_task *, int);
++int aos_task_finish(u64);
++struct aos_task *aos_task_for_current(void);
++u64 aos_task_count_cgroup(struct aos_task *);
++long aos_copy_label(char *, size_t, const char *);
++long aos_copy_path(char *, size_t, const char *);
++int __init aos_policy_init(void);
++bool aos_policy_exec_allowed(struct aos_task *, const struct path *);
++bool aos_policy_file_read_allowed(struct aos_task *, const struct path *);
++bool aos_policy_file_write_allowed(struct aos_task *, const struct path *);
++int aos_policy_check_restrict_flags(u64);
++int aos_policy_check_audit_level(u64);
++extern const struct lsm_id aos_lsmid;
++int __init aos_lsm_init(void);
++extern bool aos_enabled;
++int __init aos_control_init(void);
++long aos_control_ioctl(struct file *, unsigned int, unsigned long);
++void aos_audit_event(struct aos_task *, const char *, const char *, bool, int);
++int __init aos_audit_init(void);
++#endif
+diff -ruN linux-pristine/security/aos/aos_lsm.c linux-src/security/aos/aos_lsm.c
+--- linux-pristine/security/aos/aos_lsm.c	1970-01-01 08:00:00.000000000 +0800
++++ linux-src/security/aos/aos_lsm.c	2026-10-25 11:39:28.632581237 +0800
+@@ -0,0 +1,69 @@
++// SPDX-License-Identifier: GPL-2.0
++#include "aos_internal.h"
++bool aos_enabled __ro_after_init;
++static int aos_bprm_check_security(struct linux_binprm *bprm)
++{
++ struct aos_task *task=aos_task_for_current(); int ret=0;
++ if(!task) return 0;
++ if(!aos_policy_exec_allowed(task,&bprm->file->f_path)) ret=-EACCES;
++ if(ret) aos_audit_event(task,"exec",bprm->filename,false,ret);
++ aos_task_put(task); return ret;
++}
++static int aos_check_file(struct file *file,int mask,bool mmap)
++{
++ struct aos_task *task=aos_task_for_current(); int ret=0;
++ if(!task) return 0;
++ if((mask&MAY_WRITE)&&!aos_policy_file_write_allowed(task,&file->f_path)) ret=-EACCES;
++ else if((mask&MAY_READ)&&!aos_policy_file_read_allowed(task,&file->f_path)) ret=-EACCES;
++ if(ret) aos_audit_event(task,mmap?"mmap":"file-access",NULL,false,ret);
++ aos_task_put(task); return ret;
++}
++static int aos_file_open(struct file *file)
++{
++ int mask=0;
++ if(file->f_mode&FMODE_READ) mask|=MAY_READ;
++ if(file->f_mode&FMODE_WRITE) mask|=MAY_WRITE;
++ return aos_check_file(file,mask,false);
++}
++static int aos_file_permission(struct file *file,int mask)
++{ return aos_check_file(file,mask,false); }
++static int aos_mmap_file(struct file *file,unsigned long reqprot,unsigned long prot,unsigned long flags)
++{
++ int mask=(prot&PROT_WRITE)?MAY_WRITE:MAY_READ;
++ return aos_check_file(file,mask,true);
++}
++static int aos_check_dir(const struct path *dir,const char *op)
++{
++ struct aos_task *task=aos_task_for_current(); int ret=0;
++ if(!task) return 0;
++ if(!aos_policy_file_write_allowed(task,dir)) ret=-EACCES;
++ if(ret) aos_audit_event(task,op,NULL,false,ret);
++ aos_task_put(task); return ret;
++}
++static int aos_path_truncate(const struct path *path) { return aos_check_dir(path,"truncate"); }
++static int aos_path_mkdir(const struct path *dir,struct dentry *dentry,umode_t mode) { return aos_check_dir(dir,"mkdir"); }
++static int aos_path_rmdir(const struct path *dir,struct dentry *dentry) { return aos_check_dir(dir,"rmdir"); }
++static int aos_path_unlink(const struct path *dir,struct dentry *dentry) { return aos_check_dir(dir,"unlink"); }
++static int aos_path_mknod(const struct path *dir,struct dentry *dentry,umode_t mode,unsigned int dev) { return aos_check_dir(dir,"mknod"); }
++static int aos_path_symlink(const struct path *dir,struct dentry *dentry,const char *old_name) { return aos_check_dir(dir,"symlink"); }
++static int aos_path_link(struct dentry *old,const struct path *new_dir,struct dentry *new_dentry) { return aos_check_dir(new_dir,"link"); }
++static int aos_path_rename(const struct path *old_dir,struct dentry *old_dentry,const struct path *new_dir,struct dentry *new_dentry,unsigned int flags)
++{
++ int ret=aos_check_dir(old_dir,"rename"); return ret?ret:aos_check_dir(new_dir,"rename");
++}
++static struct security_hook_list aos_hooks[] __ro_after_init={
++ LSM_HOOK_INIT(bprm_check_security,aos_bprm_check_security),
++ LSM_HOOK_INIT(file_open,aos_file_open), LSM_HOOK_INIT(file_permission,aos_file_permission),
++ LSM_HOOK_INIT(mmap_file,aos_mmap_file), LSM_HOOK_INIT(path_mkdir,aos_path_mkdir),
++ LSM_HOOK_INIT(path_rmdir,aos_path_rmdir), LSM_HOOK_INIT(path_unlink,aos_path_unlink),
++ LSM_HOOK_INIT(path_mknod,aos_path_mknod), LSM_HOOK_INIT(path_symlink,aos_path_symlink),
++ LSM_HOOK_INIT(path_link,aos_path_link), LSM_HOOK_INIT(path_rename,aos_path_rename),
++ LSM_HOOK_INIT(path_truncate,aos_path_truncate),
++};
++const struct lsm_id aos_lsmid={.name="aos",.id=LSM_ID_AOS};
++int __init aos_lsm_init(void)
++{
++ security_add_hooks(aos_hooks,ARRAY_SIZE(aos_hooks),&aos_lsmid);
++ aos_enabled=true; return aos_control_init();
++}
++DEFINE_LSM(aos)={.name="aos",.init=aos_lsm_init};
+diff -ruN linux-pristine/security/aos/aos_policy.c linux-src/security/aos/aos_policy.c
+--- linux-pristine/security/aos/aos_policy.c	1970-01-01 08:00:00.000000000 +0800
++++ linux-src/security/aos/aos_policy.c	2026-10-25 11:22:32.027529246 +0800
+@@ -0,0 +1,35 @@
++// SPDX-License-Identifier: GPL-2.0
++#include "aos_internal.h"
++
++int __init aos_policy_init(void)
++{
++	return 0;
++}
++
++int aos_policy_check_restrict_flags(u64 flags)
++{
++	return flags & ~AOS_RESTRICT_ALL ? -EINVAL : 0;
++}
++
++int aos_policy_check_audit_level(u64 level)
++{
++	return level > AOS_AUDIT_ALL ? -EINVAL : 0;
++}
++
++bool aos_policy_exec_allowed(struct aos_task *task, const struct path *path)
++{
++	return !(READ_ONCE(task->restrict_flags) & AOS_RESTRICT_EXEC) ||
++		path_equal(path, &task->executable);
++}
++
++bool aos_policy_file_read_allowed(struct aos_task *task, const struct path *path)
++{
++	return !(READ_ONCE(task->restrict_flags) & AOS_RESTRICT_READ) ||
++		path_is_under(path, &task->workspace);
++}
++
++bool aos_policy_file_write_allowed(struct aos_task *task, const struct path *path)
++{
++	return !(READ_ONCE(task->restrict_flags) & AOS_RESTRICT_WRITE) ||
++		path_is_under(path, &task->workspace);
++}
+diff -ruN linux-pristine/security/aos/aos_task.c linux-src/security/aos/aos_task.c
+--- linux-pristine/security/aos/aos_task.c	1970-01-01 08:00:00.000000000 +0800
++++ linux-src/security/aos/aos_task.c	2026-10-25 11:39:56.702907574 +0800
+@@ -0,0 +1,98 @@
++// SPDX-License-Identifier: GPL-2.0
++#include "aos_internal.h"
++#define AOS_HASH_BITS 4
++static DEFINE_HASHTABLE(aos_task_hash, AOS_HASH_BITS);
++static DEFINE_MUTEX(aos_registry_lock);
++static atomic64_t aos_next_id = ATOMIC64_INIT(1);
++static void aos_task_free(struct kref *kref)
++{
++ struct aos_task *task = container_of(kref, struct aos_task, kref);
++ if (task->cgrp) cgroup_put(task->cgrp);
++ if (task->workspace.dentry) path_put(&task->workspace);
++ if (task->executable.dentry) path_put(&task->executable);
++ kfree(task);
++}
++void aos_task_put(struct aos_task *task) { if (task) kref_put(&task->kref, aos_task_free); }
++static struct aos_task *aos_task_alloc(void)
++{
++ struct aos_task *task = kzalloc(sizeof(*task), GFP_KERNEL_ACCOUNT);
++ if (!task) return NULL;
++ kref_init(&task->kref); spin_lock_init(&task->lock); atomic64_set(&task->n_finished, 0);
++ return task;
++}
++struct aos_task *aos_task_get(u64 id)
++{
++ struct aos_task *task;
++ mutex_lock(&aos_registry_lock);
++ hash_for_each_possible(aos_task_hash, task, hash, id) if (task->id == id) {
++  kref_get(&task->kref); mutex_unlock(&aos_registry_lock); return task;
++ }
++ mutex_unlock(&aos_registry_lock); return NULL;
++}
++int __init aos_task_init(void) { return 0; }
++struct aos_task *aos_task_create_task(const char *label, const char *workspace_path,
++ const char *exec_path, u64 restrict_flags, u64 audit_level, u64 *out_id)
++{
++ struct aos_task *task = aos_task_alloc(); long ret;
++ if (!task) return ERR_PTR(-ENOMEM);
++ ret=aos_copy_label(task->label,sizeof(task->label),label); if(ret<0) goto err;
++ ret=aos_copy_path(task->workspace_path,sizeof(task->workspace_path),workspace_path); if(ret<0) goto err;
++ ret=aos_copy_path(task->exec_path,sizeof(task->exec_path),exec_path); if(ret<0) goto err;
++ ret=aos_policy_check_restrict_flags(restrict_flags); if(ret<0) goto err;
++ ret=aos_policy_check_audit_level(audit_level); if(ret<0) goto err;
++ ret=kern_path(task->workspace_path,LOOKUP_FOLLOW|LOOKUP_DIRECTORY,&task->workspace); if(ret) goto err;
++ if(task->exec_path[0]) { ret=kern_path(task->exec_path,LOOKUP_FOLLOW,&task->executable); if(ret) goto err; }
++ if((restrict_flags&AOS_RESTRICT_EXEC)&&!task->executable.dentry) { ret=-EINVAL; goto err; }
++ task->restrict_flags=restrict_flags; task->audit_level=audit_level;
++ task->id=atomic64_fetch_add(1,&aos_next_id);
++ mutex_lock(&aos_registry_lock); hash_add(aos_task_hash,&task->hash,task->id); mutex_unlock(&aos_registry_lock);
++ aos_audit_event(task,"task-create",NULL,true,0); *out_id=task->id; return task;
++err: aos_task_put(task); return ERR_PTR(ret);
++}
++int aos_task_bind(struct aos_task *task,int cgroup_fd)
++{
++ struct cgroup *cgrp=cgroup_get_from_fd(cgroup_fd); int ret=0;
++ if(IS_ERR(cgrp)) return PTR_ERR(cgrp);
++ if(cgrp->root!=&cgrp_dfl_root || cgrp==&cgrp_dfl_root.cgrp) { cgroup_put(cgrp); return -EINVAL; }
++ mutex_lock(&aos_registry_lock);
++ if(hlist_unhashed(&task->hash)) ret=-ENOENT;
++ else if(task->cgrp) ret=-EALREADY;
++ else task->cgrp=cgrp;
++ mutex_unlock(&aos_registry_lock);
++ if(ret) cgroup_put(cgrp); else aos_audit_event(task,"task-bind",NULL,true,0);
++ return ret;
++}
++int aos_task_finish(u64 id)
++{
++ struct aos_task *task;
++ mutex_lock(&aos_registry_lock);
++ hash_for_each_possible(aos_task_hash,task,hash,id) if(task->id==id) {
++  if(task->cgrp && cgroup_is_populated(task->cgrp)) {
++   mutex_unlock(&aos_registry_lock);
++   return -EBUSY;
++  }
++  task->finishing=true;
++  hash_del_init(&task->hash); mutex_unlock(&aos_registry_lock);
++  aos_audit_event(task,"task-finish",NULL,true,0); aos_task_put(task); return 0;
++ }
++ mutex_unlock(&aos_registry_lock); return -ENOENT;
++}
++struct aos_task *aos_task_for_current(void)
++{
++ struct cgroup *cgrp=task_dfl_cgroup(current); struct aos_task *task,*found=NULL;
++ mutex_lock(&aos_registry_lock);
++ hash_for_each(aos_task_hash,task,hash) if(!task->finishing && task->cgrp&&cgroup_is_descendant(cgrp,task->cgrp)) {
++  kref_get(&task->kref); found=task; break;
++ }
++ mutex_unlock(&aos_registry_lock); return found;
++}
++u64 aos_task_count_cgroup(struct aos_task *task)
++{
++ struct css_task_iter it; struct task_struct *p; u64 count=0;
++ if(!task->cgrp) return 0;
++ css_task_iter_start(&task->cgrp->self,0,&it);
++ while((p=css_task_iter_next(&it))) if(cgroup_is_descendant(task_dfl_cgroup(p),task->cgrp)) count++;
++ css_task_iter_end(&it); return count;
++}
++long aos_copy_label(char *d,size_t n,const char *s) { return strscpy(d,s,n)<0?-EINVAL:0; }
++long aos_copy_path(char *d,size_t n,const char *s) { return strscpy(d,s,n)<0?-EINVAL:0; }
+diff -ruN linux-pristine/security/aos/Kconfig linux-src/security/aos/Kconfig
+--- linux-pristine/security/aos/Kconfig	1970-01-01 08:00:00.000000000 +0800
++++ linux-src/security/aos/Kconfig	2026-10-25 11:45:36.417959205 +0800
+@@ -0,0 +1,15 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config SECURITY_AOS
++	bool "AOS agent task containment"
++	depends on SECURITY && CGROUPS
++	select SECURITY_PATH
++	
++	default n
++	help
++	  Enable the AOS experimental task containment LSM. A privileged
++	  supervisor creates domains through /dev/aosctl
++	  and binds the policy to a cgroup v2 directory. All tasks in that
++	  cgroup subtree are checked by the AOS LSM. Workspace and executable paths are pinned.
++	  Unbound tasks are unaffected. Include aos in CONFIG_LSM to enable.
++
++	  If unsure, say N.
+diff -ruN linux-pristine/security/aos/Makefile linux-src/security/aos/Makefile
+--- linux-pristine/security/aos/Makefile	1970-01-01 08:00:00.000000000 +0800
++++ linux-src/security/aos/Makefile	2026-10-25 11:18:43.355719477 +0800
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++obj-$(CONFIG_SECURITY_AOS) := aos.o
++
++aos-y := aos_task.o aos_policy.o aos_lsm.o aos_control.o aos_audit.o
+diff -ruN linux-pristine/security/Kconfig linux-src/security/Kconfig
+--- linux-pristine/security/Kconfig	2026-10-21 16:31:09.000000000 +0800
++++ linux-src/security/Kconfig	2026-10-25 11:37:36.374277024 +0800
+@@ -225,6 +225,7 @@
+ source "security/lockdown/Kconfig"
+ source "security/landlock/Kconfig"
+ source "security/ipe/Kconfig"
++source "security/aos/Kconfig"
+ 
+ source "security/integrity/Kconfig"
+ 
+@@ -265,11 +266,11 @@
+ config LSM
+ 	string "Ordered list of enabled LSMs"
+ 	depends on SECURITY
+-	default "landlock,lockdown,yama,loadpin,safesetid,smack,selinux,tomoyo,apparmor,ipe,bpf" if DEFAULT_SECURITY_SMACK
+-	default "landlock,lockdown,yama,loadpin,safesetid,apparmor,selinux,smack,tomoyo,ipe,bpf" if DEFAULT_SECURITY_APPARMOR
+-	default "landlock,lockdown,yama,loadpin,safesetid,tomoyo,ipe,bpf" if DEFAULT_SECURITY_TOMOYO
+-	default "landlock,lockdown,yama,loadpin,safesetid,ipe,bpf" if DEFAULT_SECURITY_DAC
+-	default "landlock,lockdown,yama,loadpin,safesetid,selinux,smack,tomoyo,apparmor,ipe,bpf"
++	default "landlock,lockdown,yama,loadpin,safesetid,smack,selinux,tomoyo,apparmor,ipe,bpf,aos" if DEFAULT_SECURITY_SMACK
++	default "landlock,lockdown,yama,loadpin,safesetid,apparmor,selinux,smack,tomoyo,ipe,bpf,aos" if DEFAULT_SECURITY_APPARMOR
++	default "landlock,lockdown,yama,loadpin,safesetid,tomoyo,ipe,bpf,aos" if DEFAULT_SECURITY_TOMOYO
++	default "landlock,lockdown,yama,loadpin,safesetid,ipe,bpf,aos" if DEFAULT_SECURITY_DAC
++	default "landlock,lockdown,yama,loadpin,safesetid,selinux,smack,tomoyo,apparmor,ipe,bpf,aos"
+ 	help
+ 	  A comma-separated list of LSMs, in initialization order.
+ 	  Any LSMs left off this list, except for those with order
+diff -ruN linux-pristine/security/Makefile linux-src/security/Makefile
+--- linux-pristine/security/Makefile	2026-10-21 16:31:09.000000000 +0800
++++ linux-src/security/Makefile	2026-10-25 10:35:50.002036632 +0800
+@@ -26,6 +26,7 @@
+ obj-$(CONFIG_BPF_LSM)			+= bpf/
+ obj-$(CONFIG_SECURITY_LANDLOCK)		+= landlock/
+ obj-$(CONFIG_SECURITY_IPE)		+= ipe/
++obj-$(CONFIG_SECURITY_AOS)		+= aos/
+ 
+ # Object integrity file lists
+ obj-$(CONFIG_INTEGRITY)			+= integrity/
